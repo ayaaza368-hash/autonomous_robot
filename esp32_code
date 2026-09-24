@@ -1,0 +1,404 @@
+#include <Arduino.h>
+
+// ================= MOTOR PINS =================
+#define L_RPWM 26
+#define L_LPWM 25
+
+#define R_RPWM 27
+#define R_LPWM 33
+
+// ================= ENCODER PINS =================
+#define R_ENC_A 19
+#define R_ENC_B 23
+
+#define L_ENC_A 32
+#define L_ENC_B 14
+
+// ================= UART =================
+#define UART_RX 16
+#define UART_TX 17
+
+HardwareSerial PiSerial(2);
+
+// ================= PWM =================
+#define PWM_FREQ 20000
+#define PWM_RES 8
+
+int motorSpeed = 100;   // used only by keyboard W/A/S/D mode
+
+// ================= LEFT MOTOR COMPENSATION =================
+// TUNE this value based on your earlier drift test.
+#define LEFT_COMPENSATION 1.035
+
+// ================= SOFT START/STOP (RAMPING) =================
+#define RAMP_STEP 8
+#define RAMP_INTERVAL 15
+
+// ================= ENCODER =================
+volatile long leftTicks = 0;
+volatile long rightTicks = 0;
+
+// ================= MOTION TARGETS (for ramping) =================
+int targetLeftSpeed = 0;
+int targetRightSpeed = 0;
+
+float currentLeftSpeed = 0;
+float currentRightSpeed = 0;
+
+unsigned long lastRampTime = 0;
+
+// ================= CMD_VEL SAFETY TIMEOUT =================
+// If no 'M' (motion) command arrives for this long while in
+// cmd_vel mode, motors are stopped automatically. This protects
+// against the robot running away if Nav2/ROS crashes or the
+// UART link drops.
+#define CMDVEL_TIMEOUT_MS 500
+unsigned long lastCmdVelTime = 0;
+bool cmdVelActive = false;
+
+
+// =================================================
+// ENCODER INTERRUPTS
+// =================================================
+
+void IRAM_ATTR leftEncoderISR()
+{
+  bool A = digitalRead(L_ENC_A);
+  bool B = digitalRead(L_ENC_B);
+
+  if (A == B)
+    leftTicks++;
+  else
+    leftTicks--;
+}
+
+void IRAM_ATTR rightEncoderISR()
+{
+  bool A = digitalRead(R_ENC_A);
+  bool B = digitalRead(R_ENC_B);
+
+  if (A == B)
+    rightTicks++;
+  else
+    rightTicks--;
+}
+
+
+// =================================================
+// LEFT MOTOR (with compensation)
+// =================================================
+
+void leftMotor(int speed)
+{
+  speed = (int)(speed * LEFT_COMPENSATION);
+  speed = constrain(speed, -255, 255);
+
+  if (speed > 0)
+  {
+    ledcWrite(L_RPWM, speed);
+    ledcWrite(L_LPWM, 0);
+  }
+  else if (speed < 0)
+  {
+    ledcWrite(L_RPWM, 0);
+    ledcWrite(L_LPWM, -speed);
+  }
+  else
+  {
+    ledcWrite(L_RPWM, 0);
+    ledcWrite(L_LPWM, 0);
+  }
+}
+
+
+// =================================================
+// RIGHT MOTOR
+// =================================================
+
+void rightMotor(int speed)
+{
+  speed = constrain(speed, -255, 255);
+
+  if (speed > 0)
+  {
+    ledcWrite(R_RPWM, speed);
+    ledcWrite(R_LPWM, 0);
+  }
+  else if (speed < 0)
+  {
+    ledcWrite(R_RPWM, 0);
+    ledcWrite(R_LPWM, -speed);
+  }
+  else
+  {
+    ledcWrite(R_RPWM, 0);
+    ledcWrite(R_LPWM, 0);
+  }
+}
+
+
+// =================================================
+// STOP (immediate)
+// =================================================
+
+void stopMotors()
+{
+  targetLeftSpeed = 0;
+  targetRightSpeed = 0;
+  currentLeftSpeed = 0;
+  currentRightSpeed = 0;
+
+  leftMotor(0);
+  rightMotor(0);
+}
+
+
+// =================================================
+// RAMP UPDATE
+// =================================================
+
+void updateMotors()
+{
+  if (millis() - lastRampTime < RAMP_INTERVAL)
+    return;
+
+  lastRampTime = millis();
+
+  if (currentLeftSpeed < targetLeftSpeed)
+  {
+    currentLeftSpeed += RAMP_STEP;
+    if (currentLeftSpeed > targetLeftSpeed)
+      currentLeftSpeed = targetLeftSpeed;
+  }
+  else if (currentLeftSpeed > targetLeftSpeed)
+  {
+    currentLeftSpeed -= RAMP_STEP;
+    if (currentLeftSpeed < targetLeftSpeed)
+      currentLeftSpeed = targetLeftSpeed;
+  }
+
+  if (currentRightSpeed < targetRightSpeed)
+  {
+    currentRightSpeed += RAMP_STEP;
+    if (currentRightSpeed > targetRightSpeed)
+      currentRightSpeed = targetRightSpeed;
+  }
+  else if (currentRightSpeed > targetRightSpeed)
+  {
+    currentRightSpeed -= RAMP_STEP;
+    if (currentRightSpeed < targetRightSpeed)
+      currentRightSpeed = targetRightSpeed;
+  }
+
+  leftMotor((int)currentLeftSpeed);
+  rightMotor((int)currentRightSpeed);
+}
+
+
+// =================================================
+// COMMAND PROCESSING
+//
+// Two protocols supported over the same UART line:
+//
+//  1) KEYBOARD MODE (single characters):
+//       W / S / A / D / 0 / SPACE / + / -
+//
+//  2) CMD_VEL MODE (numeric wheel speeds, from ROS):
+//       "M,<leftSpeed>,<rightSpeed>\n"
+//       e.g.  "M,120,95\n"
+//       leftSpeed/rightSpeed are PWM values -255..255
+//       This is what robot_controller.py sends when driven by Nav2.
+// =================================================
+
+void processKeyboardCommand(char cmd)
+{
+  cmdVelActive = false;   // any keyboard key overrides cmd_vel mode
+
+  if (cmd == 'W' || cmd == 'w')
+  {
+    targetLeftSpeed = motorSpeed;
+    targetRightSpeed = motorSpeed;
+  }
+  else if (cmd == 'S' || cmd == 's')
+  {
+    targetLeftSpeed = -motorSpeed;
+    targetRightSpeed = -motorSpeed;
+  }
+  else if (cmd == 'A' || cmd == 'a')
+  {
+    targetLeftSpeed = -motorSpeed;
+    targetRightSpeed = motorSpeed;
+  }
+  else if (cmd == 'D' || cmd == 'd')
+  {
+    targetLeftSpeed = motorSpeed;
+    targetRightSpeed = -motorSpeed;
+  }
+  else if (cmd == ' ' || cmd == '0')
+  {
+    targetLeftSpeed = 0;
+    targetRightSpeed = 0;
+  }
+  else if (cmd == '+')
+  {
+    motorSpeed += 10;
+    if (motorSpeed > 255)
+      motorSpeed = 255;
+  }
+  else if (cmd == '-')
+  {
+    motorSpeed -= 10;
+    if (motorSpeed < 0)
+      motorSpeed = 0;
+  }
+}
+
+void processCmdVelLine(String line)
+{
+  // Expected format: M,<left>,<right>
+  int firstComma = line.indexOf(',');
+  int secondComma = line.indexOf(',', firstComma + 1);
+
+  if (firstComma < 0 || secondComma < 0)
+    return;   // malformed line, ignore
+
+  int leftVal = line.substring(firstComma + 1, secondComma).toInt();
+  int rightVal = line.substring(secondComma + 1).toInt();
+
+  targetLeftSpeed = constrain(leftVal, -255, 255);
+  targetRightSpeed = constrain(rightVal, -255, 255);
+
+  cmdVelActive = true;
+  lastCmdVelTime = millis();
+}
+
+
+// =================================================
+// SETUP
+// =================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  PiSerial.begin(
+    115200,
+    SERIAL_8N1,
+    UART_RX,
+    UART_TX
+  );
+
+  ledcAttach(L_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(L_LPWM, PWM_FREQ, PWM_RES);
+
+  ledcAttach(R_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(R_LPWM, PWM_FREQ, PWM_RES);
+
+  stopMotors();
+
+  pinMode(L_ENC_A, INPUT_PULLUP);
+  pinMode(L_ENC_B, INPUT_PULLUP);
+
+  pinMode(R_ENC_A, INPUT_PULLUP);
+  pinMode(R_ENC_B, INPUT_PULLUP);
+
+  attachInterrupt(
+    digitalPinToInterrupt(L_ENC_A),
+    leftEncoderISR,
+    CHANGE
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(R_ENC_A),
+    rightEncoderISR,
+    CHANGE
+  );
+
+  Serial.println("ROBOT CONTROLLER READY (keyboard + cmd_vel)");
+
+  PiSerial.println("ESP32_READY");
+}
+
+
+// =================================================
+// LOOP
+// =================================================
+
+void loop()
+{
+  // ================= RECEIVE COMMANDS =================
+
+  while (PiSerial.available())
+  {
+    char peekChar = PiSerial.peek();
+
+    if (peekChar == 'M')
+    {
+      // Numeric cmd_vel line - read until newline
+      String line = PiSerial.readStringUntil('\n');
+      line.trim();
+      processCmdVelLine(line);
+
+      Serial.print("CMDVEL: ");
+      Serial.println(line);
+    }
+    else
+    {
+      // Single character keyboard command
+      char cmd = PiSerial.read();
+
+      // Ignore stray newlines/carriage returns
+      if (cmd == '\n' || cmd == '\r')
+        continue;
+
+      processKeyboardCommand(cmd);
+
+      Serial.print("CMD: ");
+      Serial.println(cmd);
+    }
+  }
+
+  // ================= CMD_VEL SAFETY TIMEOUT =================
+
+  if (cmdVelActive && (millis() - lastCmdVelTime > CMDVEL_TIMEOUT_MS))
+  {
+    // No fresh cmd_vel received in time - stop for safety
+    targetLeftSpeed = 0;
+    targetRightSpeed = 0;
+    cmdVelActive = false;
+  }
+
+  // ================= RAMP MOTORS TOWARD TARGET =================
+
+  updateMotors();
+
+  // ================= SEND ENCODER DATA =================
+
+  static unsigned long lastSend = 0;
+
+  if (millis() - lastSend >= 100)
+  {
+    lastSend = millis();
+
+    long L, R;
+
+    noInterrupts();
+    L = leftTicks;
+    R = rightTicks;
+    interrupts();
+
+    PiSerial.print("ENC,");
+    PiSerial.print(L);
+    PiSerial.print(",");
+    PiSerial.print(R);
+    PiSerial.print(",");
+    PiSerial.println(millis());
+
+    Serial.print("L=");
+    Serial.print(L);
+    Serial.print("  R=");
+    Serial.print(R);
+    Serial.print("  T=");
+    Serial.println(millis());
+  }
+}
