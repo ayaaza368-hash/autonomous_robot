@@ -14,6 +14,9 @@
 #define L_ENC_A 32
 #define L_ENC_B 14
 
+#define LEFT_START_KICK 55
+#define RIGHT_START_KICK 75
+
 // ================= UART =================
 #define UART_RX 16
 #define UART_TX 17
@@ -164,7 +167,13 @@ void updateMotors()
 
   lastRampTime = millis();
 
-  if (currentLeftSpeed < targetLeftSpeed)
+  // ---- LEFT: kickstart if starting from rest ----
+  if (currentLeftSpeed == 0 && targetLeftSpeed != 0)
+  {
+    int kick = (targetLeftSpeed > 0) ? LEFT_START_KICK : -LEFT_START_KICK;
+    currentLeftSpeed = kick;
+  }
+  else if (currentLeftSpeed < targetLeftSpeed)
   {
     currentLeftSpeed += RAMP_STEP;
     if (currentLeftSpeed > targetLeftSpeed)
@@ -177,7 +186,13 @@ void updateMotors()
       currentLeftSpeed = targetLeftSpeed;
   }
 
-  if (currentRightSpeed < targetRightSpeed)
+  // ---- RIGHT: kickstart if starting from rest ----
+  if (currentRightSpeed == 0 && targetRightSpeed != 0)
+  {
+    int kick = (targetRightSpeed > 0) ? RIGHT_START_KICK : -RIGHT_START_KICK;
+    currentRightSpeed = kick;
+  }
+  else if (currentRightSpeed < targetRightSpeed)
   {
     currentRightSpeed += RAMP_STEP;
     if (currentRightSpeed > targetRightSpeed)
