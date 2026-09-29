@@ -31,7 +31,7 @@ int motorSpeed = 100;   // used only by keyboard W/A/S/D mode
 
 // ================= LEFT MOTOR COMPENSATION =================
 // TUNE this value based on your earlier drift test.
-#define LEFT_COMPENSATION 1.035
+#define LEFT_COMPENSATION 1.06
 
 // ================= SOFT START/STOP (RAMPING) =================
 #define RAMP_STEP 8
