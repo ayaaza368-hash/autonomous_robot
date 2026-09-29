@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <Wire.h>              // [IMU]
+#include <MPU6050_light.h>     // [IMU]
 
 // ================= MOTOR PINS =================
 #define L_RPWM 26
@@ -23,6 +25,23 @@
 
 HardwareSerial PiSerial(2);
 
+// ================= IMU (MPU6050) [IMU] =================
+#define IMU_SDA 21
+#define IMU_SCL 22
+
+// Sent to Pi as:  IMU,<gyroZ_deg_per_s>,<millis>
+// ROS (REP-103): CCW (left turn, seen from above) must be POSITIVE.
+// If CCW turn shows NEGATIVE on the IMU line, change this to -1.0f.
+// VERIFY THIS with the hand-rotation test before trusting it in ROS.
+#define IMU_GYRO_Z_SIGN 1.0f
+
+#define IMU_SEND_MS 20          // 50 Hz
+#define IMU_DEBUG_PRINT 0       // 1 = also print gyroZ on USB Serial (test only)
+
+MPU6050 mpu(Wire);
+bool imuOk = false;
+unsigned long lastImuSend = 0;
+
 // ================= PWM =================
 #define PWM_FREQ 20000
 #define PWM_RES 8
@@ -31,7 +50,7 @@ int motorSpeed = 100;   // used only by keyboard W/A/S/D mode
 
 // ================= LEFT MOTOR COMPENSATION =================
 // TUNE this value based on your earlier drift test.
-#define LEFT_COMPENSATION 1.06
+#define LEFT_COMPENSATION 1.126
 
 // ================= SOFT START/STOP (RAMPING) =================
 #define RAMP_STEP 8
@@ -289,6 +308,47 @@ void processCmdVelLine(String line)
 
 
 // =================================================
+// IMU INIT [IMU]
+// Does NOT block forever: if MPU6050 is missing, the robot
+// still boots and drives, just without IMU lines.
+// Robot MUST be still during calcOffsets().
+// =================================================
+
+void initImu()
+{
+  Wire.begin(IMU_SDA, IMU_SCL);
+
+  byte status = 1;
+  for (int attempt = 1; attempt <= 5; attempt++)
+  {
+    status = mpu.begin();
+    if (status == 0)
+      break;
+
+    Serial.print("MPU6050 begin failed, status=");
+    Serial.print(status);
+    Serial.print(" attempt ");
+    Serial.println(attempt);
+    delay(200);
+  }
+
+  if (status != 0)
+  {
+    imuOk = false;
+    Serial.println("MPU6050 NOT FOUND - continuing WITHOUT IMU (check SDA=21, SCL=22, VCC=3.3V)");
+    return;
+  }
+
+  Serial.println("MPU6050 found. CALIBRATING - DO NOT MOVE THE ROBOT!");
+  delay(1000);
+  mpu.calcOffsets(true, true);   // same call as the tested sketch
+  Serial.println("IMU calibration done.");
+
+  imuOk = true;
+}
+
+
+// =================================================
 // SETUP
 // =================================================
 
@@ -329,7 +389,9 @@ void setup()
     CHANGE
   );
 
-  Serial.println("ROBOT CONTROLLER READY (keyboard + cmd_vel)");
+  initImu();   // [IMU] motors are already stopped at this point
+
+  Serial.println("ROBOT CONTROLLER READY (keyboard + cmd_vel + imu)");
 
   PiSerial.println("ESP32_READY");
 }
@@ -341,6 +403,11 @@ void setup()
 
 void loop()
 {
+  // ================= IMU UPDATE [IMU] =================
+  // Must run every loop iteration (no long blocking calls elsewhere).
+  if (imuOk)
+    mpu.update();
+
   // ================= RECEIVE COMMANDS =================
 
   while (PiSerial.available())
@@ -386,6 +453,26 @@ void loop()
   // ================= RAMP MOTORS TOWARD TARGET =================
 
   updateMotors();
+
+  // ================= SEND IMU DATA [IMU] =================
+  // Format: IMU,<gyroZ deg/s>,<millis>
+
+  if (imuOk && (millis() - lastImuSend >= IMU_SEND_MS))
+  {
+    lastImuSend = millis();
+
+    float gz = mpu.getGyroZ() * IMU_GYRO_Z_SIGN;
+
+    PiSerial.print("IMU,");
+    PiSerial.print(gz, 3);
+    PiSerial.print(",");
+    PiSerial.println(millis());
+
+#if IMU_DEBUG_PRINT
+    Serial.print("GZ=");
+    Serial.println(gz, 2);
+#endif
+  }
 
   // ================= SEND ENCODER DATA =================
 
